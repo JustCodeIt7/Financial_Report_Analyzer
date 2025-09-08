@@ -10,13 +10,12 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 # Optional LangChain (summarization). If not available or no API key, fallback summarizer will be used.
-try:
-    from langchain_openai import ChatOpenAI
-    from langchain.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain.prompts import ChatPromptTemplate
 
-    LANGCHAIN_OK = True
-except ImportError:
-    LANGCHAIN_OK = False
+LANGCHAIN_OK = True
+
 
 # -----------------------------
 # Configuration
@@ -275,7 +274,9 @@ def get_llm():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+    llm = ChatOllama(model="llama3.2", temperature=0.2)
+    return llm
 
 
 def llm_summarize(section_text, prompt_template):
