@@ -14,8 +14,6 @@ from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain.prompts import ChatPromptTemplate
 
-LANGCHAIN_OK = True
-
 
 # -----------------------------
 # Configuration
@@ -269,8 +267,6 @@ def heuristic_risks(risk_text, top=5):
 
 
 def get_llm():
-    if not LANGCHAIN_OK:
-        return None
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -345,29 +341,6 @@ def summarize_sections(sections):
 
 
 # -----------------------------
-# Persist Summaries
-# -----------------------------
-def save_summaries(filing_id, summaries, risks, thesis):
-    conn = get_conn()
-    for section, data in summaries.items():
-        conn.execute(
-            """
-        INSERT INTO summaries (filing_id, section, bullets, thesis, risks, created_at)
-        VALUES (?,?,?,?,?,?)
-        """,
-            (
-                filing_id,
-                section,
-                data["bullets"],
-                thesis if section == "MD&A" else "",
-                json.dumps(risks),
-                datetime.utcnow().isoformat(),
-            ),
-        )
-    conn.commit()
-
-
-# -----------------------------
 # Markdown Export
 # -----------------------------
 def build_markdown(ticker, year, accession, summaries, risks, thesis):
@@ -406,7 +379,6 @@ with st.sidebar:
     run = st.button("Fetch & Analyze")
     st.markdown("---")
     st.markdown("Environment:")
-    st.write("LangChain:", LANGCHAIN_OK)
     st.write("OpenAI Key:", "Yes" if os.getenv("OPENAI_API_KEY") else "No")
 
 if run:
@@ -459,10 +431,6 @@ if run:
         file_name=f"{ticker}_{year}_10K_summary.md",
         mime="text/markdown",
     )
-
-    if st.checkbox("Save summaries to DB"):
-        save_summaries(filing_id, summaries, risks, thesis)
-        st.success("Saved.")
 
     with st.expander("Generated Markdown"):
         st.code(md_content)
