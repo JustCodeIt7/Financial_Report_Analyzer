@@ -3,7 +3,6 @@ import re
 import json
 import time
 from datetime import datetime
-from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
@@ -21,23 +20,15 @@ USER_AGENT = (
     "YourName Contact@Email.com"  # Replace with real contact per SEC guidelines
 )
 SEC_BASE = "https://data.sec.gov"
-CACHE_DIR = Path("cache")
-CACHE_DIR.mkdir(exist_ok=True)
 
 
 # -----------------------------
 # SEC Data Fetching
 # -----------------------------
 def fetch_ticker_map():
-    # Cache locally
-    path = CACHE_DIR / "company_tickers.json"
-    if path.exists():
-        return json.loads(path.read_text())
     url = "https://www.sec.gov/files/company_tickers.json"
     r = requests.get(url, headers={"User-Agent": USER_AGENT})
-    data = r.json()
-    path.write_text(json.dumps(data))
-    return data
+    return r.json()
 
 
 def cik_from_ticker(ticker: str):
