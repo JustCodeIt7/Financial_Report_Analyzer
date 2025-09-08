@@ -87,7 +87,7 @@ def get_or_fetch_filing(ticker: str, year: int):
     url = accession_to_url(acc, cik, doc)
     html = download_filing_html(url)
 
-    return filing_id, html, acc, cik
+    return html, acc, cik
 
 
 # -----------------------------
@@ -333,7 +333,7 @@ with st.sidebar:
 
 if run:
     st.write(f"Fetching {ticker} {year} 10-K ...")
-    filing_id, html, accession, cik = get_or_fetch_filing(ticker, int(year))
+    html, accession, cik = get_or_fetch_filing(ticker, int(year))
     st.success(f"Filing Accession: {accession} (CIK {cik})")
     with st.expander("Raw HTML (truncated)"):
         st.code(html[:5000])
