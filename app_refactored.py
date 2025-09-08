@@ -69,19 +69,6 @@ def download_filing_html(url: str):
 
 
 # -----------------------------
-# Filing Caching
-# -----------------------------
-def get_or_fetch_filing(ticker: str, year: int):
-    cik = cik_from_ticker(ticker)
-    submissions = get_company_submissions(cik)
-    acc, doc = find_10k_for_year(submissions, year)
-    url = accession_to_url(acc, cik, doc)
-    html = download_filing_html(url)
-
-    return html, acc, cik
-
-
-# -----------------------------
 # Section Extraction
 # -----------------------------
 ITEM_PATTERNS = {
@@ -324,8 +311,20 @@ with st.sidebar:
 
 if run:
     st.write(f"Fetching {ticker} {year} 10-K ...")
-    html, accession, cik = get_or_fetch_filing(ticker, int(year))
+    cik = cik_from_ticker(ticker)
+    if not cik:
+        st.error(f"Could not find CIK for ticker {ticker}.")
+        st.stop()
+
+    submissions = get_company_submissions(cik)
+    accession, doc = find_10k_for_year(submissions, int(year))
+    if not accession:
+        st.error(f"Could not find 10-K for {ticker} in {year}.")
+        st.stop()
+
     st.success(f"Filing Accession: {accession} (CIK {cik})")
+    url = accession_to_url(accession, cik, doc)
+    html = download_filing_html(url)
     with st.expander("Raw HTML (truncated)"):
         st.code(html[:5000])
 
