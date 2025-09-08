@@ -1,440 +1,475 @@
-# 10-K Analyzer (Simple Tutorial Version)
-# Goal: Minimal, ~under 500 lines, few moving parts, easy to explain in a YouTube video.
-# Features:
-# - Input: Ticker + Year
-# - Fetch latest (or that year) 10-K from SEC
-# - Extract 3 sections: Business (Item 1), Risk Factors (Item 1A), MD&A (Item 7)
-# - Summarize each into 10 bullets (simple heuristic or optional OpenAI)
-# - Derive Top 5 Risks + severity (heuristic)
-# - Generate 1-paragraph thesis
-# - Export Markdown
-# - Basic caching (files in .cache/)
-# - Light SEC rate limiting (sleep)
-#
-# NOTE: Intentionally minimal: little error handling, naive regex, heuristic summarization.
-# Good enough for teaching; can be improved later.
-
-import os, re, time, json, requests, streamlit as st
-from pathlib import Path
-from bs4 import BeautifulSoup
+import os
+import re
+import json
+import sqlite3
+import time
 from datetime import datetime
+from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
+import streamlit as st
 
-# ----------------------------- CONFIG ---------------------------------
-USER_AGENT = os.getenv("SEC_USER_AGENT", "Tutorial10KAnalyzer (email@example.com)")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")  # Optional
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-CACHE_DIR = Path(".cache")
+# Optional LangChain (summarization). If not available or no API key, fallback summarizer will be used.
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain.prompts import ChatPromptTemplate
+
+    LANGCHAIN_OK = True
+except ImportError:
+    LANGCHAIN_OK = False
+
+# -----------------------------
+# Configuration
+# -----------------------------
+DB_PATH = "filings.db"
+USER_AGENT = (
+    "YourName Contact@Email.com"  # Replace with real contact per SEC guidelines
+)
+SEC_BASE = "https://data.sec.gov"
+CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# ----------------------------- SIMPLE RATE LIMIT ----------------------
-_last_req = 0.0
+
+# -----------------------------
+# Database Setup
+# -----------------------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS filings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT,
+        year INTEGER,
+        cik TEXT,
+        accession TEXT,
+        html TEXT,
+        created_at TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filing_id INTEGER,
+        section TEXT,
+        bullets TEXT,
+        thesis TEXT,
+        risks TEXT,
+        created_at TEXT
+    )
+    """)
+    return conn
 
 
-def sec_get(url):
-    global _last_req
-    # Conservative: 5 requests / second max
-    elapsed = time.time() - _last_req
-    if elapsed < 0.2:
-        time.sleep(0.2 - elapsed)
-    _last_req = time.time()
-    r = requests.get(url, headers={"User-Agent": USER_AGENT})
-    r.raise_for_status()
-    return r
-
-
-# ----------------------------- TICKER -> CIK --------------------------
-TICKER_MAP_FILE = CACHE_DIR / "company_tickers.json"
-
-
-def load_ticker_map():
-    if TICKER_MAP_FILE.exists():
-        return json.loads(TICKER_MAP_FILE.read_text())
+# -----------------------------
+# SEC Data Fetching
+# -----------------------------
+def fetch_ticker_map():
+    # Cache locally
+    path = CACHE_DIR / "company_tickers.json"
+    if path.exists():
+        return json.loads(path.read_text())
     url = "https://www.sec.gov/files/company_tickers.json"
-    data = sec_get(url).json()
-    TICKER_MAP_FILE.write_text(json.dumps(data))
+    r = requests.get(url, headers={"User-Agent": USER_AGENT})
+    data = r.json()
+    path.write_text(json.dumps(data))
     return data
 
 
-def ticker_to_cik(ticker: str):
-    ticker = ticker.upper().strip()
-    data = load_ticker_map()
+def cik_from_ticker(ticker: str):
+    ticker = ticker.upper()
+    data = fetch_ticker_map()
     for entry in data.values():
         if entry["ticker"].upper() == ticker:
             return str(entry["cik_str"]).zfill(10)
     return None
 
 
-# ----------------------------- FETCH 10-K -----------------------------
-def fetch_10k_html(ticker: str, year: int):
-    # Cache path
-    cache_html = CACHE_DIR / f"{ticker}_{year}.html"
-    if cache_html.exists():
-        return cache_html.read_text()
-    cik = ticker_to_cik(ticker)
-    subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    subs = sec_get(subs_url).json()
-    recent = subs.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    accs = recent.get("accessionNumber", [])
-    dates = recent.get("filingDate", [])
-    primaries = recent.get("primaryDocument", [])
-    target_idx = None
-    # Find matching year 10-K else first 10-K
-    for i, f in enumerate(forms):
-        if f == "10-K":
-            fyear = int(dates[i].split("-")[0])
-            if fyear == year:
-                target_idx = i
-                break
-    if target_idx is None:
-        for i, f in enumerate(forms):
-            if f == "10-K":
-                target_idx = i
-                break
-    acc = accs[target_idx]
-    primary = primaries[target_idx]
-    acc_nodash = acc.replace("-", "")
-    url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/{primary}"
-    html = sec_get(url).text
-    cache_html.write_text(html)
-    return html
+def get_company_submissions(cik: str):
+    url = f"{SEC_BASE}/submissions/CIK{cik}.json"
+    r = requests.get(url, headers={"User-Agent": USER_AGENT})
+    return r.json()
 
 
-# ----------------------------- HTML -> TEXT ---------------------------
-def html_to_text(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n")
-    lines = [l.strip() for l in text.splitlines()]
-    lines = [l for l in lines if l]
-    return "\n".join(lines)
+def find_10k_for_year(submissions: dict, year: int):
+    filings = submissions.get("filings", {}).get("recent", {})
+    forms = filings.get("form", [])
+    dates = filings.get("filingDate", [])
+    acc_nums = filings.get("accessionNumber", [])
+    primary_docs = filings.get("primaryDocument", [])
+    for form, date, acc, doc in zip(forms, dates, acc_nums, primary_docs):
+        if form == "10-K" and date.startswith(str(year)):
+            return acc, doc
+    return None, None
 
 
-# ----------------------------- SECTION EXTRACTION ---------------------
-SECTION_REGEX = {
-    "business": [r"\bItem\s+1\.*\s+Business\b"],
-    "risks": [r"\bItem\s+1A\.*\s+Risk\s+Factors\b"],
-    "mdna": [r"\bItem\s+7\.*\s+Management'?s?\s+Discussion.*?Analysis\b"],
+def accession_to_url(acc: str, cik: str, primary_doc: str):
+    acc_nodashes = acc.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodashes}/{primary_doc}"
+
+
+def download_filing_html(url: str):
+    r = requests.get(url, headers={"User-Agent": USER_AGENT})
+    return r.text
+
+
+# -----------------------------
+# Filing Caching
+# -----------------------------
+def get_or_fetch_filing(ticker: str, year: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, html, accession, cik FROM filings WHERE ticker=? AND year=?",
+        (ticker.upper(), year),
+    )
+    row = cur.fetchone()
+    if row:
+        filing_id, html, acc, cik = row
+        return filing_id, html, acc, cik
+
+    cik = cik_from_ticker(ticker)
+    submissions = get_company_submissions(cik)
+    acc, doc = find_10k_for_year(submissions, year)
+    url = accession_to_url(acc, cik, doc)
+    html = download_filing_html(url)
+    conn.execute(
+        "INSERT INTO filings (ticker, year, cik, accession, html, created_at) VALUES (?,?,?,?,?,?)",
+        (ticker.upper(), year, cik, acc, html, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    filing_id = conn.execute(
+        "SELECT id FROM filings WHERE ticker=? AND year=?", (ticker.upper(), year)
+    ).fetchone()[0]
+    return filing_id, html, acc, cik
+
+
+# -----------------------------
+# Section Extraction
+# -----------------------------
+ITEM_PATTERNS = {
+    "business": r"item\s+1\.*\s*(business)",
+    "risk_factors": r"item\s+1a\.*\s*(risk factors?)",
+    "mdna": r"item\s+7\.*\s*(management['’]s discussion and analysis|management.?s discussion and analysis)",
 }
-NEXT_ITEM = re.compile(r"\bItem\s+([0-9]{1,2}[A]?)\b", re.IGNORECASE)
+
+STOP_ITEM_REGEX = r"item\s+([1-9][0-9]?[a-z]?)\."  # generic
 
 
-def extract_sections(text: str):
-    sections = {}
-    for key, patterns in SECTION_REGEX.items():
-        start = None
-        for pat in patterns:
-            m = re.search(pat, text, flags=re.IGNORECASE)
-            if m:
-                start = m.start()
+def clean_text(text: str):
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def extract_sections(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+    # Normalize
+    norm = re.sub(r"\xa0", " ", text)
+    lines = norm.splitlines()
+    joined = "\n".join([l for l in lines if l.strip()])
+
+    lower = joined.lower()
+
+    def find_section(item_regex):
+        pattern = re.compile(item_regex, re.IGNORECASE)
+        matches = list(pattern.finditer(lower))
+        if not matches:
+            return ""
+        start = matches[0].start()
+        # Find next item after start
+        stop_pattern = re.compile(STOP_ITEM_REGEX, re.IGNORECASE)
+        following = list(stop_pattern.finditer(lower, start + 10))
+        end = len(joined)
+        for m in following:
+            # ensure it's a different item number, not the same occurrence or sub-head (like 7A)
+            if m.start() > start:
+                end = m.start()
                 break
-        if start is None:
-            continue
-        next_m = None
-        for nm in NEXT_ITEM.finditer(text, start + 10):
-            if nm.start() > start:
-                next_m = nm
-                break
-        chunk = text[start : next_m.start()] if next_m else text[start:]
-        sections[key] = re.sub(r"[ \t]+", " ", chunk.strip())
+        section_raw = joined[start:end]
+        return clean_text(section_raw)
+
+    sections = {
+        "Business Overview": find_section(ITEM_PATTERNS["business"]),
+        "Risk Factors": find_section(ITEM_PATTERNS["risk_factors"]),
+        "MD&A": find_section(ITEM_PATTERNS["mdna"]),
+    }
     return sections
 
 
-# ----------------------------- SUMMARIZATION --------------------------
-KEYWORDS = [
-    "growth",
-    "revenue",
-    "profit",
-    "margin",
-    "customer",
-    "market",
-    "demand",
-    "supply",
-    "competition",
-    "regulation",
-    "strategy",
-    "cash",
-    "liquidity",
-    "cost",
-    "capital",
-    "technology",
-    "inflation",
-    "risk",
-    "operations",
-]
-
-
-def simple_bullets(text: str, n=10):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    scored = []
-    for s in sentences:
-        if 25 <= len(s) <= 260:
-            kw = sum(1 for k in KEYWORDS if k in s.lower())
-            score = kw * 10 + min(len(s), 200)
-            scored.append((score, s.strip()))
-    scored.sort(reverse=True, key=lambda x: x[0])
-    out = []
-    used_frag = set()
-    for _, s in scored:
-        frag = s.lower()[:60]
-        if frag in used_frag:
-            continue
-        used_frag.add(frag)
-        out.append(s)
-        if len(out) == n:
-            break
-    return out
-
-
-def openai_chat(prompt: str, max_tokens=600):
-    if not OPENAI_KEY:
-        return ""
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "You write concise financial bullets."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": max_tokens,
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
-
-
-def summarize_section(name: str, text: str):
-    if OPENAI_KEY:
-        prompt = f"Summarize this 10-K section into EXACTLY 10 concise bullets (<=25 words, no numbering):\n\n{text[:20000]}"
-        raw = openai_chat(prompt)
-        bullets = [l.strip("-• \t") for l in raw.splitlines() if l.strip()]
-        if len(bullets) >= 10:
-            return bullets[:10]
-    return simple_bullets(text, 10)
-
-
-# ----------------------------- RISKS ----------------------------------
-RISK_SEV_WORDS = {
-    "high": [
-        "material",
-        "significant",
-        "severe",
-        "critical",
-        "going concern",
-        "substantial",
-    ],
-    "medium": ["could", "may", "uncertain", "volatility", "challenging"],
-    "low": ["limited", "manageable", "mitigated"],
-}
-
-
-def heuristic_risk_candidates(text: str):
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    picks = []
-    for l in lines:
-        low = l.lower()
-        if any(
-            word in low
-            for word in [
-                "risk",
-                "uncertain",
-                "competition",
-                "regulation",
-                "supply",
-                "volatility",
-                "cyber",
-            ]
-        ):
-            if 40 < len(l) < 400:
-                picks.append(l)
-    # Dedup crude
-    uniq = []
-    seen = set()
-    for p in picks:
-        key = p[:70].lower()
-        if key not in seen:
-            uniq.append(p)
-            seen.add(key)
-    return uniq[:50]
-
-
-def score_severity(line: str):
-    low = line.lower()
-    score = 0
-    for w in RISK_SEV_WORDS["high"]:
-        if w in low:
-            score += 3
-    for w in RISK_SEV_WORDS["medium"]:
-        if w in low:
-            score += 1
-    for w in RISK_SEV_WORDS["low"]:
-        if w in low:
-            score -= 1
-    if score >= 4:
-        return "High"
-    if score >= 2:
-        return "Medium"
-    return "Low"
-
-
-def top_risks(risk_text: str):
-    cands = heuristic_risk_candidates(risk_text)
-    scored = []
-    rank_map = {"High": 3, "Medium": 2, "Low": 1}
-    for c in cands:
-        sev = score_severity(c)
-        scored.append((rank_map[sev], sev, c))
-    scored.sort(reverse=True, key=lambda x: (x[0], len(x[2])))
-    out = []
-    for _, sev, t in scored[:5]:
-        name = t.split(".")[0]
-        if len(name) > 80:
-            name = name[:77] + "..."
-        out.append(
-            {
-                "risk": name,
-                "severity": sev,
-                "rationale": (t[:180] + "..." if len(t) > 180 else t),
-            }
-        )
-    return out
-
-
-# ----------------------------- THESIS ---------------------------------
-def build_thesis(business_bullets, mdna_bullets, risks):
-    if OPENAI_KEY:
-        risk_list = "\n".join(f"- {r['risk']} ({r['severity']})" for r in risks)
-        prompt = f"""
-Combine these into ONE investment thesis paragraph (<=150 words):
-Business:
-{chr(10).join("- " + b for b in business_bullets)}
-MD&A:
-{chr(10).join("- " + b for b in mdna_bullets)}
-Risks:
-{risk_list}
+# -----------------------------
+# Summarization
+# -----------------------------
+DEFAULT_BULLET_PROMPT = """
+You are an analyst. Summarize the following 10-K section into exactly 10 concise, insight-rich bullets.
+Focus on: business model, growth drivers, competitive positioning, financial highlights, strategic priorities.
+Avoid boilerplate. Each bullet <= 25 words.
+Section:
+{section_text}
+Return bullets as a plain list prefixed with '- '.
 """
-        txt = openai_chat(prompt, max_tokens=220)
-        # Small clean
-        return txt.strip()
-    # Fallback heuristic
-    return (
-        "Investment Thesis: The company shows "
-        + "; ".join(business_bullets[:3])
-        + ". Operational/financial themes: "
-        + "; ".join(mdna_bullets[:3])
-        + ". Key risks: "
-        + ", ".join(f"{r['risk']} ({r['severity']})" for r in risks)
-        + "."
+
+RISK_PROMPT = """
+Extract the 5 most material distinct risks from the Risk Factors section below.
+For each risk produce:
+- Short title (max 8 words)
+- One-line description (<=25 words)
+- Severity (High, Medium, Low) – judge from wording ('significant', 'material', 'could adversely', etc.)
+Return JSON list with objects: title, description, severity.
+Section:
+{risk_text}
+"""
+
+THESIS_PROMPT = """
+Write one investment thesis paragraph (max 120 words) synthesizing the company's position, growth levers, key risks, and outlook based on the extracted summaries.
+Use neutral, professional tone.
+Bullets Data:
+{bullets_json}
+Risks Data:
+{risks_json}
+"""
+
+
+def simple_sentence_split(text):
+    return re.split(r"(?<=[.!?])\s+", text)
+
+
+def fallback_bullets(section_text, count=10):
+    sentences = simple_sentence_split(section_text)[:count]
+    bullets = []
+    for s in sentences:
+        s = clean_text(s)
+        if s:
+            bullets.append("- " + s[:180])
+    while len(bullets) < count:
+        bullets.append("- (insufficient content)")
+    return "\n".join(bullets[:count])
+
+
+def heuristic_risks(risk_text, top=5):
+    paragraphs = [p for p in risk_text.split("\n") if len(p.split()) > 8]
+    scored = []
+    for p in paragraphs:
+        score = 0
+        lw = p.lower()
+        for kw in ["significant", "material", "adverse", "substantial", "severe"]:
+            if kw in lw:
+                score += 2
+        for kw in ["may", "could", "risk"]:
+            if kw in lw:
+                score += 1
+        scored.append((score, p))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    risks = []
+    for score, para in scored[:top]:
+        sev = "High" if score >= 5 else "Medium" if score >= 3 else "Low"
+        title = " ".join(para.split()[:6])
+        risks.append(
+            {"title": title, "description": clean_text(para)[:160], "severity": sev}
+        )
+    return risks
+
+
+def get_llm():
+    if not LANGCHAIN_OK:
+        return None
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+
+
+def llm_summarize(section_text, prompt_template):
+    llm = get_llm()
+    if not llm:
+        return None
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    chain = prompt | llm
+    out = chain.invoke({"section_text": section_text})
+    return out.content.strip()
+
+
+def llm_json(section_text, prompt_template):
+    llm = get_llm()
+    if not llm:
+        return None
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    chain = prompt | llm
+    out = chain.invoke({"risk_text": section_text})
+    txt = out.content.strip()
+    # Try to extract JSON block
+    m = re.search(r"\[.*\]", txt, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except:
+            return None
+    return None
+
+
+def llm_thesis(bullets_json, risks_json):
+    llm = get_llm()
+    if not llm:
+        return None
+    prompt = ChatPromptTemplate.from_template(THESIS_PROMPT)
+    chain = prompt | llm
+    out = chain.invoke(
+        {
+            "bullets_json": json.dumps(bullets_json, indent=2),
+            "risks_json": json.dumps(risks_json, indent=2),
+        }
     )
+    return out.content.strip()
 
 
-# ----------------------------- MARKDOWN EXPORT ------------------------
-def export_md(ticker, year, sections, bullets, risks, thesis):
-    lines = []
-    lines.append(f"# {ticker} {year} 10-K Analysis")
-    lines.append(f"_Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}_")
-    lines.append("")
-    lines.append("## Investment Thesis")
-    lines.append(thesis.strip())
-    lines.append("")
-    label_map = {
-        "business": "Business Overview (Item 1)",
-        "risks": "Risk Factors (Item 1A)",
-        "mdna": "MD&A (Item 7)",
-    }
-    order = ["business", "risks", "mdna"]
-    for k in order:
-        if k in bullets:
-            lines.append(f"## {label_map[k]}")
-            for b in bullets[k]:
-                lines.append(f"- {b}")
-            lines.append("")
-            if k == "risks":
-                lines.append("### Top 5 Risks")
-                for r in risks:
-                    lines.append(
-                        f"- **{r['risk']}** (Severity: {r['severity']}) — {r['rationale']}"
-                    )
-                lines.append("")
-    return "\n".join(lines)
+def summarize_sections(sections):
+    results = {}
+    risks_struct = []
+    for name, text in sections.items():
+        if not text:
+            results[name] = {"bullets": "- (section not found)"}
+            continue
+        bullets = llm_summarize(text, DEFAULT_BULLET_PROMPT)
+        if not bullets:
+            bullets = fallback_bullets(text)
+        results[name] = {"bullets": bullets}
+        if name == "Risk Factors":
+            parsed = llm_json(text, RISK_PROMPT)
+            if not parsed:
+                parsed = heuristic_risks(text)
+            risks_struct = parsed
+    thesis = llm_thesis({k: v["bullets"] for k, v in results.items()}, risks_struct)
+    if not thesis:
+        thesis = "Thesis: Company exhibits identifiable risks and strategic drivers; deeper LLM analysis requires API key."
+    return results, risks_struct, thesis
 
 
-# ----------------------------- STREAMLIT UI ---------------------------
-st.set_page_config(page_title="Simple 10-K Analyzer", layout="wide")
-st.title("Simple 10-K Analyzer (Tutorial Build)")
-st.caption(
-    "Fetch a 10-K, extract sections, make bullets, list top risks, and produce a thesis. Educational demo."
-)
-ticker = st.text_input("Ticker", value="AAPL")
-year = st.number_input(
-    "Year (filing year - approximate)", min_value=1995, max_value=2100, value=2024
-)
-run = st.button("Fetch & Analyze", type="primary")
+# -----------------------------
+# Persist Summaries
+# -----------------------------
+def save_summaries(filing_id, summaries, risks, thesis):
+    conn = get_conn()
+    for section, data in summaries.items():
+        conn.execute(
+            """
+        INSERT INTO summaries (filing_id, section, bullets, thesis, risks, created_at)
+        VALUES (?,?,?,?,?,?)
+        """,
+            (
+                filing_id,
+                section,
+                data["bullets"],
+                thesis if section == "MD&A" else "",
+                json.dumps(risks),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+    conn.commit()
+
+
+# -----------------------------
+# Markdown Export
+# -----------------------------
+def build_markdown(ticker, year, accession, summaries, risks, thesis):
+    md = []
+    md.append(f"# {ticker} {year} 10-K Highlights")
+    md.append(f"*Accession:* {accession}")
+    md.append("")
+    for section, data in summaries.items():
+        md.append(f"## {section}")
+        md.append(data["bullets"])
+        md.append("")
+    md.append("## Top 5 Risks")
+    for r in risks:
+        md.append(f"- **{r['title']}** ({r['severity']}): {r['description']}")
+    md.append("")
+    md.append("## Investment Thesis")
+    md.append(thesis)
+    return "\n".join(md)
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="10-K Analyzer", layout="wide")
+st.title("10-K Financial Report Analyzer (Simplified Demo)")
+
+with st.sidebar:
+    st.markdown("### Input")
+    ticker = st.text_input("Ticker", value="AAPL").upper()
+    year = st.number_input(
+        "Filing Year",
+        min_value=2005,
+        max_value=datetime.now().year,
+        value=datetime.now().year - 1,
+    )
+    run = st.button("Fetch & Analyze")
+    st.markdown("---")
+    st.markdown("Environment:")
+    st.write("LangChain:", LANGCHAIN_OK)
+    st.write("OpenAI Key:", "Yes" if os.getenv("OPENAI_API_KEY") else "No")
 
 if run:
-    with st.spinner("Downloading 10-K..."):
-        html = fetch_10k_html(ticker, int(year))
-    text = html_to_text(html)
-    with st.spinner("Extracting sections..."):
-        sections = extract_sections(text)
-    st.subheader("Raw Extracted Sections (truncated)")
-    for key, label in [
-        ("business", "Business"),
-        ("risks", "Risk Factors"),
-        ("mdna", "MD&A"),
-    ]:
-        if key in sections:
-            st.markdown(f"### {label}")
-            st.text(sections[key][:3000] + ("..." if len(sections[key]) > 3000 else ""))
-    with st.spinner("Summarizing sections..."):
-        bullets = {}
-        for k, label in [
-            ("business", "Business"),
-            ("risks", "Risk Factors"),
-            ("mdna", "MD&A"),
-        ]:
-            if k in sections:
-                bullets[k] = summarize_section(label, sections[k])
-    with st.spinner("Analyzing risks..."):
-        risks = top_risks(sections.get("risks", "")) if "risks" in sections else []
-    with st.spinner("Building thesis..."):
-        thesis = build_thesis(
-            bullets.get("business", []), bullets.get("mdna", []), risks
-        )
-    st.markdown("## Investment Thesis")
-    st.write(thesis)
-    st.markdown("## Section Bullet Summaries")
+    st.write(f"Fetching {ticker} {year} 10-K ...")
+    filing_id, html, accession, cik = get_or_fetch_filing(ticker, int(year))
+    st.success(f"Filing Accession: {accession} (CIK {cik})")
+    with st.expander("Raw HTML (truncated)"):
+        st.code(html[:5000])
+
+    st.write("Extracting key sections...")
+    sections = extract_sections(html)
     col1, col2, col3 = st.columns(3)
-    for idx, (k, title) in enumerate(
-        [("business", "Business"), ("risks", "Risk Factors"), ("mdna", "MD&A")]
-    ):
-        if k in bullets:
-            col = [col1, col2, col3][idx % 3]
-            with col:
-                st.markdown(f"### {title}")
-                for b in bullets[k]:
-                    st.markdown(f"- {b}")
-    if risks:
-        st.markdown("## Top 5 Risks")
-        for r in risks:
-            st.markdown(
-                f"- **{r['risk']}** (Severity: {r['severity']}) — {r['rationale']}"
-            )
-    md = export_md(ticker.upper(), int(year), sections, bullets, risks, thesis)
+    col1.subheader("Business Overview")
+    col1.write(
+        sections["Business Overview"][:1500]
+        + ("..." if len(sections["Business Overview"]) > 1500 else "")
+    )
+    col2.subheader("Risk Factors")
+    col2.write(
+        sections["Risk Factors"][:1500]
+        + ("..." if len(sections["Risk Factors"]) > 1500 else "")
+    )
+    col3.subheader("MD&A")
+    col3.write(
+        sections["MD&A"][:1500] + ("..." if len(sections["MD&A"]) > 1500 else "")
+    )
+
+    st.write("Summarizing (may use LLM if available)...")
+    start = time.time()
+    summaries, risks, thesis = summarize_sections(sections)
+    duration = time.time() - start
+    st.info(f"Summarization complete in {duration:.2f}s")
+
+    st.header("Section Summaries")
+    for section, data in summaries.items():
+        st.subheader(section)
+        st.text(data["bullets"])
+
+    st.header("Top 5 Risks")
+    for r in risks:
+        st.markdown(f"- **{r['title']}** ({r['severity']}): {r['description']}")
+
+    st.header("Investment Thesis")
+    st.write(thesis)
+
+    md_content = build_markdown(ticker, year, accession, summaries, risks, thesis)
     st.download_button(
         "Download Markdown",
-        data=md,
-        file_name=f"{ticker.upper()}_{year}_10K_analysis.md",
+        data=md_content,
+        file_name=f"{ticker}_{year}_10K_summary.md",
         mime="text/markdown",
     )
 
-st.markdown("---")
-st.caption(
-    "No investment advice. Educational demo. Add robust error handling, better parsing, vector search, and advanced LLM logic in a production version."
-)
+    if st.checkbox("Save summaries to DB"):
+        save_summaries(filing_id, summaries, risks, thesis)
+        st.success("Saved.")
+
+    with st.expander("Generated Markdown"):
+        st.code(md_content)
+
+# -----------------------------
+# Footer
+# -----------------------------
+st.markdown("""
+---
+Demo tool. For educational use only. Always verify extracted information against the original filing. 
+""")
