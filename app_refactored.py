@@ -4,14 +4,13 @@ import json
 import time
 from datetime import datetime
 import requests
-from bs4 import BeautifulSoup
 import streamlit as st
 
 # Optional LangChain (summarization). If not available or no API key, fallback summarizer will be used.
 from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 from langchain.prompts import ChatPromptTemplate
-
+from langchain_core.output_parsers import JsonOutputParser
 
 # -----------------------------
 # Configuration
@@ -71,54 +70,57 @@ def download_filing_html(url: str):
 # -----------------------------
 # Section Extraction
 # -----------------------------
-ITEM_PATTERNS = {
-    "business": r"item\s+1\.*\s*(business)",
-    "risk_factors": r"item\s+1a\.*\s*(risk factors?)",
-    "mdna": r"item\s+7\.*\s*(management['’]s discussion and analysis|management.?s discussion and analysis)",
-}
+HTML_EXTRACTION_PROMPT = """
+From the provided HTML of a 10-K filing, extract the full text for the following sections:
+- Item 1: Business
+- Item 1A: Risk Factors
+- Item 7: Management's Discussion and Analysis of Financial Condition and Results of Operations (MD&A)
 
-STOP_ITEM_REGEX = r"item\s+([1-9][0-9]?[a-z]?)\."  # generic
+Identify the start of each section by looking for patterns like "Item 1.", "Item 1A.", and "Item 7.".
+Extract all text content belonging to that section until the start of the next major "Item".
+
+Return the extracted content in a single JSON object with the following keys:
+"Business Overview", "Risk Factors", "MD&A".
+
+HTML Content:
+{html_content}
+"""
 
 
-def clean_text(text: str):
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def extract_sections_with_llm(html: str):
+    """
+    Extracts key sections from 10-K HTML using an LLM.
+    """
+    llm = get_llm()
+    if not llm:
+        st.warning(
+            "LLM not available. Section extraction will fail. Please set up an API key."
+        )
+        return {"Business Overview": "", "Risk Factors": "", "MD&A": ""}
 
+    prompt = ChatPromptTemplate.from_template(HTML_EXTRACTION_PROMPT)
+    parser = JsonOutputParser()
+    chain = prompt | llm | parser
 
-def extract_sections(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    # Normalize
-    norm = re.sub(r"\xa0", " ", text)
-    lines = norm.splitlines()
-    joined = "\n".join([l for l in lines if l.strip()])
+    # To avoid exceeding token limits, we can truncate the HTML.
+    # The key sections are usually in the first part of the document.
+    max_chars = 300000  # A reasonable limit, can be adjusted
+    truncated_html = html[:max_chars]
 
-    lower = joined.lower()
-
-    def find_section(item_regex):
-        pattern = re.compile(item_regex, re.IGNORECASE)
-        matches = list(pattern.finditer(lower))
-        if not matches:
-            return ""
-        start = matches[0].start()
-        # Find next item after start
-        stop_pattern = re.compile(STOP_ITEM_REGEX, re.IGNORECASE)
-        following = list(stop_pattern.finditer(lower, start + 10))
-        end = len(joined)
-        for m in following:
-            # ensure it's a different item number, not the same occurrence or sub-head (like 7A)
-            if m.start() > start:
-                end = m.start()
-                break
-        section_raw = joined[start:end]
-        return clean_text(section_raw)
-
-    sections = {
-        "Business Overview": find_section(ITEM_PATTERNS["business"]),
-        "Risk Factors": find_section(ITEM_PATTERNS["risk_factors"]),
-        "MD&A": find_section(ITEM_PATTERNS["mdna"]),
-    }
-    return sections
+    try:
+        extracted_json = chain.invoke({"html_content": truncated_html})
+        # Ensure all keys are present
+        for key in ["Business Overview", "Risk Factors", "MD&A"]:
+            if key not in extracted_json:
+                extracted_json[key] = f"(LLM failed to extract section: {key})"
+        return extracted_json
+    except Exception as e:
+        st.error(f"Failed to extract sections with LLM: {e}")
+        return {
+            "Business Overview": "(Extraction Failed)",
+            "Risk Factors": "(Extraction Failed)",
+            "MD&A": "(Extraction Failed)",
+        }
 
 
 # -----------------------------
@@ -152,6 +154,11 @@ Bullets Data:
 Risks Data:
 {risks_json}
 """
+
+
+def clean_text(text: str):
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def simple_sentence_split(text):
@@ -195,12 +202,10 @@ def heuristic_risks(risk_text, top=5):
 
 
 def get_llm():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    llm = ChatOllama(model="llama3.2", temperature=0.2)
-    return llm
+    # Check if the Ollama service is available
+    ollama_llm = ChatOllama(model="phi4-mini", temperature=0)
+    ollama_llm.invoke("test")  # A quick check
+    return ollama_llm
 
 
 def llm_summarize(section_text, prompt_template):
@@ -250,21 +255,25 @@ def summarize_sections(sections):
     results = {}
     risks_struct = []
     for name, text in sections.items():
-        if not text:
-            results[name] = {"bullets": "- (section not found)"}
+        if not text or "(Extraction Failed)" in text or "(section not found)" in text:
+            results[name] = {"bullets": "- (section not found or extraction failed)"}
             continue
+
         bullets = llm_summarize(text, DEFAULT_BULLET_PROMPT)
         if not bullets:
             bullets = fallback_bullets(text)
         results[name] = {"bullets": bullets}
+
         if name == "Risk Factors":
             parsed = llm_json(text, RISK_PROMPT)
             if not parsed:
                 parsed = heuristic_risks(text)
             risks_struct = parsed
+
     thesis = llm_thesis({k: v["bullets"] for k, v in results.items()}, risks_struct)
     if not thesis:
         thesis = "Thesis: Company exhibits identifiable risks and strategic drivers; deeper LLM analysis requires API key."
+
     return results, risks_struct, thesis
 
 
@@ -293,7 +302,7 @@ def build_markdown(ticker, year, accession, summaries, risks, thesis):
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="10-K Analyzer", layout="wide")
-st.title("10-K Financial Report Analyzer (Simplified Demo)")
+st.title("10-K Financial Report Analyzer (LLM-Powered)")
 
 with st.sidebar:
     st.markdown("### Input")
@@ -307,7 +316,8 @@ with st.sidebar:
     run = st.button("Fetch & Analyze")
     st.markdown("---")
     st.markdown("Environment:")
-    st.write("OpenAI Key:", "Yes" if os.getenv("OPENAI_API_KEY") else "No")
+    st.write("LLM Available:", "Yes" if get_llm() else "No")
+
 
 if run:
     st.write(f"Fetching {ticker} {year} 10-K ...")
@@ -328,8 +338,9 @@ if run:
     with st.expander("Raw HTML (truncated)"):
         st.code(html[:5000])
 
-    st.write("Extracting key sections...")
-    sections = extract_sections(html)
+    st.write("Extracting key sections using LLM...")
+    sections = extract_sections_with_llm(html)
+
     col1, col2, col3 = st.columns(3)
     col1.subheader("Business Overview")
     col1.write(

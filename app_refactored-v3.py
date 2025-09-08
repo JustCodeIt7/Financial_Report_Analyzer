@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import time
 from datetime import datetime
@@ -11,7 +10,6 @@ import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain.prompts import ChatPromptTemplate
-
 
 # -----------------------------
 # Configuration
@@ -69,67 +67,216 @@ def download_filing_html(url: str):
 
 
 # -----------------------------
-# Section Extraction
+# LLM-based HTML Content Extraction
 # -----------------------------
-ITEM_PATTERNS = {
-    "business": r"item\s+1\.*\s*(business)",
-    "risk_factors": r"item\s+1a\.*\s*(risk factors?)",
-    "mdna": r"item\s+7\.*\s*(management['’]s discussion and analysis|management.?s discussion and analysis)",
-}
 
-STOP_ITEM_REGEX = r"item\s+([1-9][0-9]?[a-z]?)\."  # generic
+HTML_EXTRACTION_PROMPT = """
+You are an expert HTML content extractor. Extract all relevant data from the provided HTML content and structure it into a clear, organized JSON format.
+
+Focus on identifying and extracting:
+1. Document metadata (title, company name, filing type, date)
+2. Section headings and their hierarchy
+3. Key business sections (Item 1 - Business, Item 1A - Risk Factors, Item 7 - MD&A)
+4. Tables with financial data
+5. Links and references
+6. Text content organized by sections
+7. Any embedded structured data
+
+For SEC 10-K filings specifically, pay attention to:
+- Item numbers and section titles
+- Business description content
+- Risk factors enumeration
+- Management discussion and analysis
+- Financial tables and metrics
+
+Structure the output as a comprehensive JSON object with nested elements representing the document hierarchy. Ensure all text content is clean and properly formatted.
+
+HTML Content:
+{html_content}
+
+Return only a valid JSON object with the extracted and structured data:
+"""
 
 
-def clean_text(text: str):
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def get_llm():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        return ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+
+    # Fallback to Ollama if available
+    try:
+        return ChatOllama(model="llama3.2", temperature=0.1)
+    except:
+        return None
 
 
-def extract_sections(html: str):
+def extract_html_content_with_llm(html: str):
+    """Extract structured content from HTML using LLM"""
+    llm = get_llm()
+    if not llm:
+        return fallback_html_extraction(html)
+
+    # Clean and truncate HTML for LLM processing
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    # Normalize
-    norm = re.sub(r"\xa0", " ", text)
-    lines = norm.splitlines()
-    joined = "\n".join([l for l in lines if l.strip()])
+    # Remove script and style elements
+    for script in soup(["script", "style"]):
+        script.decompose()
 
-    lower = joined.lower()
+    # Get clean text with some HTML structure preserved
+    clean_html = str(soup)
 
-    def find_section(item_regex):
-        pattern = re.compile(item_regex, re.IGNORECASE)
-        matches = list(pattern.finditer(lower))
-        if not matches:
-            return ""
-        start = matches[0].start()
-        # Find next item after start
-        stop_pattern = re.compile(STOP_ITEM_REGEX, re.IGNORECASE)
-        following = list(stop_pattern.finditer(lower, start + 10))
-        end = len(joined)
-        for m in following:
-            # ensure it's a different item number, not the same occurrence or sub-head (like 7A)
-            if m.start() > start:
-                end = m.start()
-                break
-        section_raw = joined[start:end]
-        return clean_text(section_raw)
+    # Truncate if too long (adjust based on LLM context limits)
+    if len(clean_html) > 50000:
+        clean_html = clean_html[:50000] + "... [truncated]"
 
-    sections = {
-        "Business Overview": find_section(ITEM_PATTERNS["business"]),
-        "Risk Factors": find_section(ITEM_PATTERNS["risk_factors"]),
-        "MD&A": find_section(ITEM_PATTERNS["mdna"]),
+    try:
+        prompt = ChatPromptTemplate.from_template(HTML_EXTRACTION_PROMPT)
+        chain = prompt | llm
+        response = chain.invoke({"html_content": clean_html})
+
+        # Extract JSON from response
+        content = response.content.strip()
+
+        # Try to find JSON block
+        if content.startswith("```json"):
+            content = content.replace("```json", "").replace("```", "").strip()
+        elif content.startswith("```"):
+            content = content.replace("```", "").strip()
+
+        # Parse JSON
+        extracted_data = json.loads(content)
+        return extracted_data
+
+    except Exception as e:
+        print(f"LLM extraction failed: {e}")
+        return fallback_html_extraction(html)
+
+
+def fallback_html_extraction(html: str):
+    """Fallback extraction method when LLM is not available"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Basic extraction without regex
+    title = soup.find("title")
+    title_text = title.get_text().strip() if title else "Unknown Document"
+
+    # Find all headings
+    headings = []
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        headings.append({"level": int(tag.name[1]), "text": tag.get_text().strip()})
+
+    # Get all text content
+    full_text = soup.get_text(separator="\n").strip()
+
+    # Basic section identification
+    sections = {"business": "", "risk_factors": "", "mdna": ""}
+
+    # Simple text-based section detection
+    text_lower = full_text.lower()
+
+    # Find business section
+    business_start = text_lower.find("item 1") and text_lower.find("business")
+    if business_start != -1:
+        # Get next 5000 characters as a rough section
+        sections["business"] = full_text[business_start : business_start + 5000]
+
+    return {
+        "metadata": {"title": title_text, "extraction_method": "fallback"},
+        "headings": headings,
+        "sections": sections,
+        "full_text": full_text[:10000],  # Truncate for performance
     }
+
+
+def extract_sections_from_structured_data(extracted_data):
+    """Convert LLM-extracted structured data to the expected sections format"""
+    sections = {"Business Overview": "", "Risk Factors": "", "MD&A": ""}
+
+    # Try to find sections in the structured data
+    if "sections" in extracted_data:
+        for section_key, section_data in extracted_data["sections"].items():
+            section_lower = section_key.lower()
+            if "business" in section_lower:
+                if isinstance(section_data, dict) and "content" in section_data:
+                    sections["Business Overview"] = section_data["content"]
+                elif isinstance(section_data, str):
+                    sections["Business Overview"] = section_data
+            elif "risk" in section_lower:
+                if isinstance(section_data, dict) and "content" in section_data:
+                    sections["Risk Factors"] = section_data["content"]
+                elif isinstance(section_data, str):
+                    sections["Risk Factors"] = section_data
+            elif "md&a" in section_lower or "management" in section_lower:
+                if isinstance(section_data, dict) and "content" in section_data:
+                    sections["MD&A"] = section_data["content"]
+                elif isinstance(section_data, str):
+                    sections["MD&A"] = section_data
+
+    # If sections are empty, try to extract from full text
+    if not any(sections.values()) and "full_text" in extracted_data:
+        full_text = extracted_data["full_text"]
+        # Use simple keyword-based extraction as fallback
+        sections = simple_section_extraction(full_text)
+
+    return sections
+
+
+def simple_section_extraction(text: str):
+    """Simple keyword-based section extraction as ultimate fallback"""
+    sections = {"Business Overview": "", "Risk Factors": "", "MD&A": ""}
+
+    text_lower = text.lower()
+
+    # Find business section
+    business_keywords = ["item 1", "business", "overview", "operations"]
+    for keyword in business_keywords:
+        start = text_lower.find(keyword)
+        if start != -1:
+            sections["Business Overview"] = text[start : start + 3000]
+            break
+
+    # Find risk factors
+    risk_keywords = ["risk factors", "item 1a", "risks"]
+    for keyword in risk_keywords:
+        start = text_lower.find(keyword)
+        if start != -1:
+            sections["Risk Factors"] = text[start : start + 3000]
+            break
+
+    # Find MD&A
+    mdna_keywords = ["management's discussion", "item 7", "md&a"]
+    for keyword in mdna_keywords:
+        start = text_lower.find(keyword)
+        if start != -1:
+            sections["MD&A"] = text[start : start + 3000]
+            break
+
+    return sections
+
+
+# Updated extract_sections function
+def extract_sections(html: str):
+    """Main function to extract sections using LLM-based approach"""
+    # Extract structured data using LLM
+    extracted_data = extract_html_content_with_llm(html)
+
+    # Convert to expected sections format
+    sections = extract_sections_from_structured_data(extracted_data)
+
     return sections
 
 
 # -----------------------------
-# Summarization
+# Summarization (keeping existing functions)
 # -----------------------------
 DEFAULT_BULLET_PROMPT = """
 You are an analyst. Summarize the following 10-K section into exactly 10 concise, insight-rich bullets.
 Focus on: business model, growth drivers, competitive positioning, financial highlights, strategic priorities.
 Avoid boilerplate. Each bullet <= 25 words.
+
 Section:
 {section_text}
+
 Return bullets as a plain list prefixed with '- '.
 """
 
@@ -139,7 +286,9 @@ For each risk produce:
 - Short title (max 8 words)
 - One-line description (<=25 words)
 - Severity (High, Medium, Low) – judge from wording ('significant', 'material', 'could adversely', etc.)
+
 Return JSON list with objects: title, description, severity.
+
 Section:
 {risk_text}
 """
@@ -147,14 +296,22 @@ Section:
 THESIS_PROMPT = """
 Write one investment thesis paragraph (max 120 words) synthesizing the company's position, growth levers, key risks, and outlook based on the extracted summaries.
 Use neutral, professional tone.
+
 Bullets Data:
 {bullets_json}
+
 Risks Data:
 {risks_json}
 """
 
 
+def clean_text(text: str):
+    return " ".join(text.split()).strip()
+
+
 def simple_sentence_split(text):
+    import re
+
     return re.split(r"(?<=[.!?])\s+", text)
 
 
@@ -194,15 +351,6 @@ def heuristic_risks(risk_text, top=5):
     return risks
 
 
-def get_llm():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    llm = ChatOllama(model="llama3.2", temperature=0.2)
-    return llm
-
-
 def llm_summarize(section_text, prompt_template):
     llm = get_llm()
     if not llm:
@@ -222,6 +370,8 @@ def llm_json(section_text, prompt_template):
     out = chain.invoke({"risk_text": section_text})
     txt = out.content.strip()
     # Try to extract JSON block
+    import re
+
     m = re.search(r"\[.*\]", txt, re.DOTALL)
     if m:
         try:
@@ -262,6 +412,7 @@ def summarize_sections(sections):
             if not parsed:
                 parsed = heuristic_risks(text)
             risks_struct = parsed
+
     thesis = llm_thesis({k: v["bullets"] for k, v in results.items()}, risks_struct)
     if not thesis:
         thesis = "Thesis: Company exhibits identifiable risks and strategic drivers; deeper LLM analysis requires API key."
@@ -293,7 +444,7 @@ def build_markdown(ticker, year, accession, summaries, risks, thesis):
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="10-K Analyzer", layout="wide")
-st.title("10-K Financial Report Analyzer (Simplified Demo)")
+st.title("10-K Financial Report Analyzer (LLM-Enhanced)")
 
 with st.sidebar:
     st.markdown("### Input")
@@ -308,6 +459,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("Environment:")
     st.write("OpenAI Key:", "Yes" if os.getenv("OPENAI_API_KEY") else "No")
+    st.write("Extraction Method:", "LLM-Enhanced" if get_llm() else "Fallback")
 
 if run:
     st.write(f"Fetching {ticker} {year} 10-K ...")
@@ -328,7 +480,7 @@ if run:
     with st.expander("Raw HTML (truncated)"):
         st.code(html[:5000])
 
-    st.write("Extracting key sections...")
+    st.write("Extracting key sections using LLM...")
     sections = extract_sections(html)
     col1, col2, col3 = st.columns(3)
     col1.subheader("Business Overview")
