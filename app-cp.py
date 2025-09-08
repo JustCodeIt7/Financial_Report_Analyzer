@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -18,43 +17,12 @@ from langchain.prompts import ChatPromptTemplate
 # -----------------------------
 # Configuration
 # -----------------------------
-DB_PATH = "filings.db"
 USER_AGENT = (
     "YourName Contact@Email.com"  # Replace with real contact per SEC guidelines
 )
 SEC_BASE = "https://data.sec.gov"
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
-
-
-# -----------------------------
-# Database Setup
-# -----------------------------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS filings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ticker TEXT,
-        year INTEGER,
-        cik TEXT,
-        accession TEXT,
-        html TEXT,
-        created_at TEXT
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS summaries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filing_id INTEGER,
-        section TEXT,
-        bullets TEXT,
-        thesis TEXT,
-        risks TEXT,
-        created_at TEXT
-    )
-    """)
-    return conn
 
 
 # -----------------------------
@@ -113,30 +81,12 @@ def download_filing_html(url: str):
 # Filing Caching
 # -----------------------------
 def get_or_fetch_filing(ticker: str, year: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, html, accession, cik FROM filings WHERE ticker=? AND year=?",
-        (ticker.upper(), year),
-    )
-    row = cur.fetchone()
-    if row:
-        filing_id, html, acc, cik = row
-        return filing_id, html, acc, cik
-
     cik = cik_from_ticker(ticker)
     submissions = get_company_submissions(cik)
     acc, doc = find_10k_for_year(submissions, year)
     url = accession_to_url(acc, cik, doc)
     html = download_filing_html(url)
-    conn.execute(
-        "INSERT INTO filings (ticker, year, cik, accession, html, created_at) VALUES (?,?,?,?,?,?)",
-        (ticker.upper(), year, cik, acc, html, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    filing_id = conn.execute(
-        "SELECT id FROM filings WHERE ticker=? AND year=?", (ticker.upper(), year)
-    ).fetchone()[0]
+
     return filing_id, html, acc, cik
 
 
@@ -434,11 +384,3 @@ if run:
 
     with st.expander("Generated Markdown"):
         st.code(md_content)
-
-# -----------------------------
-# Footer
-# -----------------------------
-st.markdown("""
----
-Demo tool. For educational use only. Always verify extracted information against the original filing. 
-""")
