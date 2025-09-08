@@ -1,396 +1,552 @@
-# -*- coding: utf-8 -*-
-"""
-A beginner-friendly Python script to fetch, parse, and analyze 10-K filings
-from the U.S. Securities and Exchange Commission (SEC).
-
-This script is designed for a YouTube tutorial, demonstrating web scraping,
-text processing, and basic data analysis in a single, easy-to-follow file.
-
-Author: Your Name
-Contact: Your Contact Info
-Version: 1.0
-"""
-
-# =============================================================================
-# 1. IMPORTS - The Tools We Need
-# =============================================================================
-# These are the Python libraries we'll use.
-# - `os`: To interact with the operating system (e.g., for environment variables).
-# - `re`: Stands for "Regular Expressions," used for advanced text pattern matching.
-# - `json`: To work with JSON data, a common format for web data.
-# - `time`: To add delays in our code, which is polite when scraping websites.
-# - `requests`: A popular library to make HTTP requests to websites and get data.
-# - `BeautifulSoup`: A fantastic library for parsing HTML and XML documents.
-
+# =========================================================
+# STEP 1. Imports & Optional Dependencies
+# =========================================================
 import os
 import re
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Dict, Tuple, List, Optional, Any
+
 import requests
 from bs4 import BeautifulSoup
+import streamlit as st
 
-# --- Optional LLM Imports (Advanced) ---
-# These are for an advanced feature (summarization with AI).
-# If you don't have them, the script will use a simpler fallback.
+# Optional LangChain wrappers; handle absence gracefully for tutorial clarity
 try:
     from langchain_openai import ChatOpenAI
-    from langchain.prompts import ChatPromptTemplate
-
-    LANGCHAIN_AVAILABLE = True
 except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    print("Note: LangChain or OpenAI library not found. Using fallback summarizer.")
+    ChatOpenAI = None  # type: ignore
+
+try:
+    from langchain_ollama import ChatOllama
+except ImportError:
+    ChatOllama = None  # type: ignore
+
+try:
+    from langchain.prompts import ChatPromptTemplate
+except ImportError:
+    ChatPromptTemplate = None  # type: ignore
 
 
-# =============================================================================
-# 2. CONFIGURATION - Setting Up Our Script
-# =============================================================================
-# It's a good practice to keep settings in one place.
+# =========================================================
+# STEP 2. Configuration Constants
+# =========================================================
+USER_AGENT = (
+    "YourName Contact@Email.com"  # Replace with real contact per SEC fair-use guidance
+)
+SEC_BASE = "https://data.sec.gov"
 
-# The SEC requires you to identify yourself in your requests.
-# Replace with your actual name and email.
-USER_AGENT = "Your Name your.email@example.com"
+# Regex patterns for section extraction
+ITEM_PATTERNS = {
+    "business": r"item\s+1\.*\s*(business)",
+    "risk_factors": r"item\s+1a\.*\s*(risk factors?)",
+    "mdna": r"item\s+7\.*\s*(management['’]s discussion and analysis|management.?s discussion and analysis)",
+}
+STOP_ITEM_REGEX = r"item\s+([1-9][0-9]?[a-z]?)\."
 
-# A simple file-based cache to avoid re-downloading the same data.
-# This saves time and reduces load on the SEC's servers.
-CACHE_FILE = "sec_filings_cache.json"
+# Prompt templates (kept as raw multi-line strings for readability)
+DEFAULT_BULLET_PROMPT = """
+You are an analyst. Summarize the following 10-K section into exactly 10 concise, insight-rich bullets.
+Focus on: business model, growth drivers, competitive positioning, financial highlights, strategic priorities.
+Avoid boilerplate. Each bullet <= 25 words.
+Section:
+{section_text}
+Return bullets as a plain list prefixed with '- '.
+"""
+
+RISK_PROMPT = """
+Extract the 5 most material distinct risks from the Risk Factors section below.
+For each risk produce:
+- Short title (max 8 words)
+- One-line description (<=25 words)
+- Severity (High, Medium, Low) – judge from wording ('significant', 'material', 'could adversely', etc.)
+Return JSON list with objects: title, description, severity.
+Section:
+{risk_text}
+"""
+
+THESIS_PROMPT = """
+Write one investment thesis paragraph (max 120 words) synthesizing the company's position, growth levers, key risks, and outlook based on the extracted summaries.
+Use neutral, professional tone.
+Bullets Data:
+{bullets_json}
+Risks Data:
+{risks_json}
+"""
 
 
-# =============================================================================
-# 3. CACHING - Saving and Loading Data
-# =============================================================================
-# Web scraping can be slow. Caching saves the data we've already downloaded.
+# =========================================================
+# STEP 3. Data Structures
+# =========================================================
+@dataclass
+class FilingReference:
+    """Holds minimal identity metadata for a filing."""
+
+    cik: str
+    accession: str
+    primary_doc: str
+    url: str
 
 
-def load_cache():
-    """Loads the cache from a JSON file if it exists."""
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}  # Return empty cache if file is corrupted
-    return {}
+@dataclass
+class UIState:
+    """Captured input parameters from the sidebar."""
+
+    ticker: str
+    year: int
+    run: bool
+    has_openai_key: bool
 
 
-def save_cache(cache):
-    """Saves the given cache dictionary to a JSON file."""
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache, f, indent=4)
+# =========================================================
+# STEP 4. Simple Utility Functions
+# =========================================================
+def clean_text(text: str) -> str:
+    """Normalize whitespace."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
-# =============================================================================
-# 4. SEC DATA FETCHING - Getting Data from the SEC Website
-# =============================================================================
-# These functions handle the logic of finding and downloading company filings.
+def simple_sentence_split(text: str) -> List[str]:
+    """Naive sentence splitter for fallback summarization."""
+    return re.split(r"(?<=[.!?])\s+", text)
 
 
-def get_company_info(ticker):
-    """
-    Fetches company metadata from the SEC, including the CIK.
-    The CIK (Central Index Key) is a unique identifier for each company.
-
-    Args:
-        ticker (str): The company's stock ticker (e.g., "AAPL" for Apple).
-
-    Returns:
-        str: The 10-digit CIK for the company, or None if not found.
-    """
-    print(f"Fetching company list to find CIK for {ticker}...")
+# =========================================================
+# STEP 5. SEC Data Fetching & Caching Layer
+# =========================================================
+@st.cache_data(show_spinner=False)
+def fetch_ticker_map() -> Dict[str, Any]:
+    """Retrieve the master ticker->CIK mapping JSON from SEC."""
     url = "https://www.sec.gov/files/company_tickers.json"
-    try:
-        response = requests.get(url, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()  # Raise an error for bad responses (4xx or 5xx)
-        all_companies = response.json()
-
-        # Find the CIK for the given ticker
-        for company in all_companies.values():
-            if company["ticker"].upper() == ticker.upper():
-                cik = str(company["cik_str"]).zfill(10)
-                print(f"Found CIK: {cik}")
-                return cik
-        print(f"Error: Ticker '{ticker}' not found.")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching company list: {e}")
-        return None
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-def get_latest_10k_filing_url(cik):
-    """
-    Finds the URL for the most recent '10-K' annual filing for a given CIK.
+def cik_from_ticker(ticker: str) -> Optional[str]:
+    """Lookup CIK (zero-padded) for a given ticker symbol."""
+    data = fetch_ticker_map()
+    t = ticker.upper()
+    for entry in data.values():
+        if entry.get("ticker", "").upper() == t:
+            return str(entry["cik_str"]).zfill(10)
+    return None
 
-    Args:
-        cik (str): The company's 10-digit CIK.
 
-    Returns:
-        str: The URL to the primary document of the latest 10-K filing, or None.
-    """
+@st.cache_data(show_spinner=False)
+def get_company_submissions(cik: str) -> Dict[str, Any]:
+    """Fetch submissions JSON for a given CIK."""
+    url = f"{SEC_BASE}/submissions/CIK{cik}.json"
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def find_10k_for_year(
+    submissions: dict, year: int
+) -> Tuple[Optional[str], Optional[str]]:
+    """Locate the accession number & primary document for the desired year's 10-K."""
+    filings = submissions.get("filings", {}).get("recent", {})
+    for form, date, acc, doc in zip(
+        filings.get("form", []),
+        filings.get("filingDate", []),
+        filings.get("accessionNumber", []),
+        filings.get("primaryDocument", []),
+    ):
+        if form == "10-K" and date.startswith(str(year)):
+            return acc, doc
+    return None, None
+
+
+def accession_to_url(acc: str, cik: str, primary_doc: str) -> str:
+    """Construct the direct SEC archive URL to the filing's primary document."""
+    acc_nodashes = acc.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodashes}/{primary_doc}"
+
+
+def download_filing_html(url: str) -> str:
+    """Download the raw HTML for a filing."""
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
+    r.raise_for_status()
+    return r.text
+
+
+def get_filing(ticker: str, year: int) -> Tuple[str, FilingReference]:
+    """High-level convenience: from ticker+year -> Filing HTML & metadata."""
+    cik = cik_from_ticker(ticker)
     if not cik:
-        return None
-
-    print(f"Fetching submissions for CIK {cik}...")
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    try:
-        response = requests.get(url, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-        submissions = response.json()
-
-        # Find the first '10-K' in the list of recent filings
-        recent_filings = submissions["filings"]["recent"]
-        for i, form in enumerate(recent_filings["form"]):
-            if form == "10-K":
-                accession_num = recent_filings["accessionNumber"][i].replace("-", "")
-                primary_doc = recent_filings["primaryDocument"][i]
-                filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_num}/{primary_doc}"
-                print(f"Found latest 10-K filing: {filing_url}")
-                return filing_url
-
-        print("Error: No 10-K filing found in recent submissions.")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching submissions: {e}")
-        return None
-    except KeyError:
-        print(
-            "Error: Could not parse submissions JSON. The structure might have changed."
-        )
-        return None
+        raise ValueError(f"Unable to find CIK for ticker '{ticker}'.")
+    submissions = get_company_submissions(cik)
+    acc, doc = find_10k_for_year(submissions, year)
+    if not acc or not doc:
+        raise ValueError(f"No 10-K filing found for {ticker} in {year}.")
+    url = accession_to_url(acc, cik, doc)
+    html = download_filing_html(url)
+    return html, FilingReference(cik=cik, accession=acc, primary_doc=doc, url=url)
 
 
-def fetch_filing_html(url, ticker, year):
+# =========================================================
+# STEP 6. Section Extraction Logic
+# =========================================================
+def extract_sections(html: str) -> Dict[str, str]:
     """
-    Fetches the HTML content of a filing from a URL, using a cache.
-
-    Args:
-        url (str): The URL of the filing to download.
-        ticker (str): The company ticker, used as a cache key.
-        year (int): The filing year, used as a cache key.
-
-    Returns:
-        str: The HTML content of the filing, or None if fetching fails.
+    Parse the filing HTML and heuristically extract select sections.
+    NOTE: Real-world production systems should use more robust parsing (XBRL / structured docs).
     """
-    cache = load_cache()
-    cache_key = f"{ticker}_{year}"
-
-    if cache_key in cache:
-        print("Found filing in cache. Loading from file.")
-        return cache[cache_key]
-
-    if not url:
-        return None
-
-    print("Filing not in cache. Downloading from SEC...")
-    try:
-        response = requests.get(url, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-        html_content = response.text
-
-        # Save to cache before returning
-        cache[cache_key] = html_content
-        save_cache(cache)
-
-        return html_content
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading filing: {e}")
-        return None
-
-
-# =============================================================================
-# 5. TEXT EXTRACTION - Pulling Information from HTML
-# =============================================================================
-# This is where we parse the messy HTML to find the sections we care about.
-
-
-def extract_text_from_html(html_content):
-    """
-    Uses BeautifulSoup to extract clean, readable text from HTML.
-
-    Args:
-        html_content (str): The raw HTML of the filing.
-
-    Returns:
-        str: The cleaned text content.
-    """
-    print("Extracting text from HTML using BeautifulSoup...")
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    # Get all text and join with newlines
+    soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
+    normalized = re.sub(r"\xa0", " ", text)
+    lines = [l for l in normalized.splitlines() if l.strip()]
+    joined = "\n".join(lines)
+    lowered = joined.lower()
 
-    # Clean up whitespace and non-breaking spaces
-    text = re.sub(r"\xa0", " ", text)  # Replace non-breaking spaces
-    text = re.sub(r"\s*\n\s*", "\n", text)  # Normalize newlines
+    def slice_section(pattern: str) -> str:
+        """Capture text between an 'Item X' marker and the next 'Item Y' marker."""
+        compiled = re.compile(pattern, re.IGNORECASE)
+        matches = list(compiled.finditer(lowered))
+        if not matches:
+            return ""
+        start = matches[0].start()
 
-    return text
+        stop_pattern = re.compile(STOP_ITEM_REGEX, re.IGNORECASE)
+        following = list(stop_pattern.finditer(lowered, start + 10))
+        end = len(joined)
+        for m in following:
+            if m.start() > start:
+                end = m.start()
+                break
+        section_raw = joined[start:end]
+        return clean_text(section_raw)
 
-
-def extract_section(full_text, start_pattern, end_pattern):
-    """
-    Extracts a specific section from the text of the filing, like "Risk Factors".
-    It uses regular expressions to find the start and end of a section.
-
-    Args:
-        full_text (str): The entire text of the filing.
-        start_pattern (str): A regex pattern to find the start of the section.
-        end_pattern (str): A regex pattern to find the start of the *next* section.
-
-    Returns:
-        str: The extracted text of the section, or a "not found" message.
-    """
-    # Use re.IGNORECASE to match "Item 1", "item 1", "ITEM 1", etc.
-    start_match = re.search(start_pattern, full_text, re.IGNORECASE)
-
-    if not start_match:
-        return "Section not found."
-
-    # Find the start of the *next* item to define the end of our section
-    end_match = re.search(end_pattern, full_text[start_match.end() :], re.IGNORECASE)
-
-    if end_match:
-        section_text = full_text[
-            start_match.start() : start_match.end() + end_match.start()
-        ]
-    else:
-        # If no end pattern is found, take a fixed number of characters
-        section_text = full_text[start_match.start() : start_match.start() + 20000]
-
-    return section_text.strip()
-
-
-# =============================================================================
-# 6. SUMMARIZATION - Making Sense of the Text
-# =============================================================================
-# These functions summarize the long, extracted sections into key points.
-
-
-def fallback_summarizer(section_text, num_sentences=5):
-    """
-    A simple summarizer that just extracts the first few sentences.
-    This is used if the AI-based summarizer isn't available.
-    """
-    # Split text into sentences
-    sentences = re.split(r"(?<=[.!?])\s+", section_text)
-
-    # Get the first `num_sentences` non-empty sentences
-    summary = "\n- ".join([s.strip() for s in sentences if s.strip()][:num_sentences])
-    return "- " + summary if summary else "Could not generate a summary."
-
-
-def summarize_with_llm(section_text):
-    """
-    Summarizes a section using an external Large Language Model (LLM) like GPT.
-    This is an advanced feature and requires an API key.
-
-    Args:
-        section_text (str): The text to summarize.
-
-    Returns:
-        str: A bullet-point summary from the LLM.
-    """
-    if not LANGCHAIN_AVAILABLE or not os.getenv("OPENAI_API_KEY"):
-        return None  # Signal that LLM is not available
-
-    print("Summarizing with LLM...")
-
-    # The prompt tells the AI exactly what we want it to do.
-    prompt_template = """
-    You are a financial analyst. Summarize the following section of a 10-K report
-    into 5 concise, insightful bullet points. Focus on the most critical information.
-    
-    Section Text:
-    ---
-    {text}
-    ---
-    
-    Summary:
-    """
-
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-    chain = prompt | llm
-
-    try:
-        response = chain.invoke(
-            {"text": section_text[:15000]}
-        )  # Limit text to avoid high costs
-        return response.content
-    except Exception as e:
-        print(f"LLM summarization failed: {e}")
-        return None  # Fallback to simple summarizer if API fails
-
-
-# =============================================================================
-# 7. MAIN APPLICATION LOGIC - Putting It All Together
-# =============================================================================
-# This is where we define the main workflow of our script.
-
-
-def run_analyzer():
-    """The main function that orchestrates the entire process."""
-
-    # --- Step 1: Get User Input ---
-    print("\n--- SEC 10-K Financial Report Analyzer ---")
-    ticker = input("Enter a company ticker (e.g., AAPL, GOOGL, MSFT): ").strip().upper()
-    year = datetime.now().year - 1  # Default to last year
-
-    # --- Step 2: Fetch Company Info and Filing ---
-    cik = get_company_info(ticker)
-    if not cik:
-        return  # Stop if we can't find the company
-
-    filing_url = get_latest_10k_filing_url(cik)
-    if not filing_url:
-        return  # Stop if no 10-K is found
-
-    html_content = fetch_filing_html(filing_url, ticker, year)
-    if not html_content:
-        return  # Stop if download fails
-
-    # --- Step 3: Extract Text and Sections ---
-    full_text = extract_text_from_html(html_content)
-
-    print("\nExtracting key sections from the filing...")
-
-    # Regex patterns to find the start of each section.
-    # The `.` in "Item 1." is escaped as `\.`
-    business_section = extract_section(full_text, r"Item 1\.\s+Business", r"Item 1A\.")
-    risk_factors_section = extract_section(
-        full_text, r"Item 1A\.\s+Risk Factors", r"Item 1B\."
-    )
-    mda_section = extract_section(
-        full_text, r"Item 7\.\s+Management's Discussion and Analysis", r"Item 7A\."
-    )
-
-    # --- Step 4: Summarize and Display Results ---
-    sections = {
-        "Business Overview (Item 1)": business_section,
-        "Risk Factors (Item 1A)": risk_factors_section,
-        "Management's Discussion and Analysis (Item 7)": mda_section,
+    return {
+        "Business Overview": slice_section(ITEM_PATTERNS["business"]),
+        "Risk Factors": slice_section(ITEM_PATTERNS["risk_factors"]),
+        "MD&A": slice_section(ITEM_PATTERNS["mdna"]),
     }
 
-    print("\n--- Analysis Results ---\n")
-    for title, text in sections.items():
-        print(f"--- {title} ---\n")
 
-        # Try LLM summary first, then use fallback
-        summary = summarize_with_llm(text)
-        if not summary:
-            print("(Using fallback summarizer)")
-            summary = fallback_summarizer(text)
+# =========================================================
+# STEP 7. Summarization Helpers (Fallback + Heuristics)
+# =========================================================
+def fallback_bullets(section_text: str, count: int = 10) -> str:
+    """Create simple bullets from the first N sentences if no LLM available."""
+    sentences = [
+        clean_text(s) for s in simple_sentence_split(section_text) if s.strip()
+    ]
+    chosen = sentences[:count]
+    bullets = ["- " + s[:180] for s in chosen]
+    while len(bullets) < count:
+        bullets.append("- (insufficient content)")
+    return "\n".join(bullets[:count])
 
-        print(summary)
-        print("\n" + "=" * 50 + "\n")
+
+def heuristic_risks(risk_text: str, top: int = 5) -> List[Dict[str, str]]:
+    """
+    Crude heuristic risk extraction based on keyword scoring.
+    Produces a list of risk objects: title, description, severity.
+    """
+    paragraphs = [p for p in risk_text.split("\n") if len(p.split()) > 8]
+    scored: List[Tuple[int, str]] = []
+    for p in paragraphs:
+        lw = p.lower()
+        score = sum(
+            2
+            for kw in ["significant", "material", "adverse", "substantial", "severe"]
+            if kw in lw
+        )
+        score += sum(1 for kw in ["may", "could", "risk"] if kw in lw)
+        scored.append((score, p))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    risks: List[Dict[str, str]] = []
+    for score, para in scored[:top]:
+        sev = "High" if score >= 5 else "Medium" if score >= 3 else "Low"
+        title = " ".join(para.split()[:6])
+        risks.append(
+            {"title": title, "description": clean_text(para)[:160], "severity": sev}
+        )
+    return risks
 
 
-# =============================================================================
-# 8. SCRIPT EXECUTION - Running the App
-# =============================================================================
-# This standard Python construct ensures the `run_analyzer` function is called
-# only when the script is executed directly (not when imported as a module).
+# =========================================================
+# STEP 8. LLM Integration (Optional)
+# =========================================================
+def get_llm():
+    """
+    Try to return an LLM client (OpenAI or Ollama) if available.
+    Priority or selection logic can be adjusted easily for tutorial demonstration.
+    """
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+    llm = ChatOllama(model="llama3.2", temperature=0.2)
+    return llm
 
+
+def llm_invoke_single_var(
+    llm, template: str, var_name: str, content: str
+) -> Optional[str]:
+    """Helper to run a one-variable prompt template."""
+    if not llm or ChatPromptTemplate is None:
+        return None
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm
+    try:
+        out = chain.invoke({var_name: content})
+        return out.content.strip()
+    except Exception:
+        return None
+
+
+def llm_summarize_section(section_text: str) -> Optional[str]:
+    return llm_invoke_single_var(
+        get_llm(), DEFAULT_BULLET_PROMPT, "section_text", section_text
+    )
+
+
+def llm_extract_risks(risk_text: str) -> Optional[List[Dict[str, str]]]:
+    """Attempt structured risk extraction via LLM returning JSON."""
+    raw = llm_invoke_single_var(get_llm(), RISK_PROMPT, "risk_text", risk_text)
+    if not raw:
+        return None
+    m = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def llm_write_thesis(
+    bullets_json: Dict[str, str], risks_json: List[Dict[str, str]]
+) -> Optional[str]:
+    if not ChatPromptTemplate:
+        return None
+    llm = get_llm()
+    if not llm:
+        return None
+    prompt = ChatPromptTemplate.from_template(THESIS_PROMPT)
+    chain = prompt | llm
+    try:
+        out = chain.invoke(
+            {
+                "bullets_json": json.dumps(bullets_json, indent=2),
+                "risks_json": json.dumps(risks_json, indent=2),
+            }
+        )
+        return out.content.strip()
+    except Exception:
+        return None
+
+
+# =========================================================
+# STEP 9. High-Level Summarization Orchestrator
+# =========================================================
+def summarize_sections(
+    sections: Dict[str, str],
+) -> Tuple[Dict[str, Dict[str, str]], List[Dict[str, str]], str]:
+    """
+    For each extracted section:
+      - Attempt LLM bullet summary; fallback to heuristic bullet creation.
+      - For Risk Factors, attempt LLM JSON extraction; fallback to heuristic risk scoring.
+      - Build an overall thesis paragraph.
+    """
+    results: Dict[str, Dict[str, str]] = {}
+    risks_struct: List[Dict[str, str]] = []
+
+    for name, text in sections.items():
+        if not text:
+            results[name] = {"bullets": "- (section not found)"}
+            continue
+
+        bullets = llm_summarize_section(text)
+        if not bullets:
+            bullets = fallback_bullets(text)
+
+        results[name] = {"bullets": bullets}
+
+        if name == "Risk Factors":
+            parsed_risks = llm_extract_risks(text)
+            if not parsed_risks:
+                parsed_risks = heuristic_risks(text)
+            risks_struct = parsed_risks
+
+    thesis = llm_write_thesis(
+        {k: v["bullets"] for k, v in results.items()}, risks_struct
+    )
+    if not thesis:
+        thesis = "Thesis: Company exhibits identifiable risks and strategic drivers; deeper LLM analysis requires API key or local model."
+    return results, risks_struct, thesis
+
+
+# =========================================================
+# STEP 10. Markdown Export
+# =========================================================
+def build_markdown(
+    ticker: str,
+    year: int,
+    filing: FilingReference,
+    summaries: Dict[str, Dict[str, str]],
+    risks: List[Dict[str, str]],
+    thesis: str,
+) -> str:
+    """Assemble a Markdown report for download or sharing."""
+    md = []
+    md.append(f"# {ticker} {year} 10-K Highlights")
+    md.append(f"*Accession:* {filing.accession}  |  *CIK:* {filing.cik}")
+    md.append(f"*Source URL:* {filing.url}")
+    md.append("")
+    for section, data in summaries.items():
+        md.append(f"## {section}")
+        md.append(data["bullets"])
+        md.append("")
+    md.append("## Top 5 Risks")
+    for r in risks:
+        md.append(f"- **{r['title']}** ({r['severity']}): {r['description']}")
+    md.append("")
+    md.append("## Investment Thesis")
+    md.append(thesis)
+    return "\n".join(md)
+
+
+# =========================================================
+# STEP 11. Streamlit UI Components
+# =========================================================
+def configure_page():
+    """Initial page setup for Streamlit."""
+    st.set_page_config(page_title="10-K Analyzer", layout="wide")
+    st.title("10-K Financial Report Analyzer (Refactored Tutorial Version)")
+    st.caption(
+        "Educational example: Rapid filing section extraction + heuristic / LLM summaries."
+    )
+
+
+def sidebar_inputs() -> UIState:
+    """Render sidebar inputs and return the collected UI state."""
+    with st.sidebar:
+        st.header("Input")
+        ticker = st.text_input("Ticker", value="AAPL").upper().strip()
+        year = st.number_input(
+            "Filing Year",
+            min_value=2005,
+            max_value=datetime.now().year,
+            value=datetime.now().year - 1,
+        )
+        run = st.button("Fetch & Analyze")
+        st.markdown("---")
+        has_key = bool(os.getenv("OPENAI_API_KEY"))
+        st.write("OpenAI Key:", "✅" if has_key else "❌")
+        return UIState(ticker=ticker, year=int(year), run=run, has_openai_key=has_key)
+
+
+def render_sections_preview(sections: Dict[str, str], truncate: int = 1500):
+    """Show truncated raw section text for transparency before summarization."""
+    col1, col2, col3 = st.columns(3)
+    col1.subheader("Business Overview")
+    col1.write(
+        sections["Business Overview"][:truncate]
+        + ("..." if len(sections["Business Overview"]) > truncate else "")
+    )
+    col2.subheader("Risk Factors")
+    col2.write(
+        sections["Risk Factors"][:truncate]
+        + ("..." if len(sections["Risk Factors"]) > truncate else "")
+    )
+    col3.subheader("MD&A")
+    col3.write(
+        sections["MD&A"][:truncate]
+        + ("..." if len(sections["MD&A"]) > truncate else "")
+    )
+
+
+def render_summaries(summaries: Dict[str, Dict[str, str]]):
+    """Display bullet summaries for each section."""
+    st.header("Section Summaries")
+    for section, data in summaries.items():
+        st.subheader(section)
+        st.text(data["bullets"])
+
+
+def render_risks(risks: List[Dict[str, str]]):
+    """Display structured risk output."""
+    st.header("Top 5 Risks")
+    if not risks:
+        st.info("No risks extracted.")
+        return
+    for r in risks:
+        st.markdown(f"- **{r['title']}** ({r['severity']}): {r['description']}")
+
+
+def render_thesis(thesis: str):
+    """Display synthesized investment thesis."""
+    st.header("Investment Thesis")
+    st.write(thesis)
+
+
+# =========================================================
+# STEP 12. Orchestrating the App Logic
+# =========================================================
+def run_analysis(ui: UIState):
+    """Execute the full fetch -> extract -> summarize -> display pipeline."""
+    try:
+        st.write(f"Fetching {ui.ticker} {ui.year} 10-K ...")
+        html, filing_ref = get_filing(ui.ticker, ui.year)
+        st.success(f"Filing Accession: {filing_ref.accession} (CIK {filing_ref.cik})")
+        with st.expander("Raw HTML (first 5000 chars)"):
+            st.code(html[:5000])
+
+        st.write("Extracting key sections...")
+        sections = extract_sections(html)
+        render_sections_preview(sections)
+
+        st.write("Summarizing (LLM if available, else fallback heuristics)...")
+        start = time.time()
+        summaries, risks, thesis = summarize_sections(sections)
+        elapsed = time.time() - start
+        st.info(f"Summarization complete in {elapsed:.2f} seconds.")
+
+        render_summaries(summaries)
+        render_risks(risks)
+        render_thesis(thesis)
+
+        md_content = build_markdown(
+            ui.ticker, ui.year, filing_ref, summaries, risks, thesis
+        )
+        st.download_button(
+            "Download Markdown Report",
+            data=md_content,
+            file_name=f"{ui.ticker}_{ui.year}_10K_summary.md",
+            mime="text/markdown",
+        )
+        with st.expander("Generated Markdown"):
+            st.code(md_content)
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+
+# =========================================================
+# STEP 13. Entry Point
+# =========================================================
+def main():
+    """
+    Main entry point for:
+      - Local script execution: python streamlit_10k_app.py
+      - Streamlit execution: streamlit run streamlit_10k_app.py
+    """
+    configure_page()
+    ui_state = sidebar_inputs()
+    if ui_state.run:
+        run_analysis(ui_state)
+    else:
+        st.info("Enter a ticker & year, then click 'Fetch & Analyze' to begin.")
+
+
+# Standard Python entry guard.
 if __name__ == "__main__":
-    run_analyzer()
-
-# --- Example of How to Run ---
+    # NOTE: When running via `streamlit run`, Streamlit executes the file top-to-bottom.
+    # The guard still allows conventional script execution if needed.
+    main()
